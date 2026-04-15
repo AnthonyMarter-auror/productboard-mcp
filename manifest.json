@@ -1,12 +1,32 @@
 {
+  "manifest_version": "0.1",
   "name": "productboard-mcp",
+  "display_name": "Productboard",
   "version": "0.2.1",
   "description": "MCP server for the Productboard API. Enables AI assistants (Claude, Cursor, etc.) to interact with your Productboard workspace.",
-  "author": "Enreign",
+  "author": {
+    "name": "Enreign",
+    "url": "https://github.com/Enreign"
+  },
   "license": "MIT",
-  "repository": "https://github.com/Enreign/productboard-mcp",
-  "runtime": "node",
-  "entrypoint": "server/index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Enreign/productboard-mcp"
+  },
+  "homepage": "https://github.com/Enreign/productboard-mcp",
+  "server": {
+    "type": "node",
+    "entry_point": "dist/index.js",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/dist/index.js"],
+      "env": {
+        "PRODUCTBOARD_API_TOKEN": "${user_config.PRODUCTBOARD_API_TOKEN}",
+        "PRODUCTBOARD_AUTH_TYPE": "${user_config.PRODUCTBOARD_AUTH_TYPE}",
+        "LOG_LEVEL": "${user_config.LOG_LEVEL}"
+      }
+    }
+  },
   "tools": [
     { "name": "pb_feature_list", "description": "List features with filtering" },
     { "name": "pb_feature_get", "description": "Get a feature by ID" },
@@ -30,23 +50,34 @@
     { "name": "pb_release_status_update", "description": "Update release status" },
     { "name": "pb_release_timeline", "description": "Get release timeline" }
   ],
-  "configSchema": {
+  "keywords": ["productboard", "mcp", "product-management"],
+  "compatibility": {
+    "platforms": ["darwin", "win32", "linux"],
+    "runtimes": {
+      "node": ">=18.0.0"
+    }
+  },
+  "user_config": {
     "PRODUCTBOARD_API_TOKEN": {
       "type": "string",
+      "title": "Productboard API Token",
+      "description": "Your Productboard API token. Get it from Profile & Settings → API Access in your Productboard workspace.",
       "required": true,
-      "description": "Your Productboard API token. Get it from Profile & Settings → API Access in your Productboard workspace."
+      "sensitive": true
     },
     "PRODUCTBOARD_AUTH_TYPE": {
       "type": "string",
+      "title": "Auth Type",
+      "description": "Auth type: bearer or oauth2",
       "required": false,
-      "default": "bearer",
-      "description": "Auth type: bearer or oauth2"
+      "default": "bearer"
     },
     "LOG_LEVEL": {
       "type": "string",
+      "title": "Log Level",
+      "description": "Log level: trace, debug, info, warn, error, fatal. Keep at error for MCP clients.",
       "required": false,
-      "default": "error",
-      "description": "Log level: trace, debug, info, warn, error, fatal. Keep at error for MCP clients."
+      "default": "error"
     }
   }
 }
