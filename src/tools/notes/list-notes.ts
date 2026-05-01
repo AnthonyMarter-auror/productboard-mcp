@@ -20,6 +20,11 @@ interface ListNotesParams {
   limit?: number;
 }
 
+interface ResolvedFeature {
+  name: string;
+  url: string | null;
+}
+
 export class ListNotesTool extends BaseTool<ListNotesParams> {
   constructor(apiClient: ProductboardAPIClient, logger: Logger) {
     super(
@@ -102,6 +107,31 @@ export class ListNotesTool extends BaseTool<ListNotesParams> {
     );
   }
 
+  /** Resolve a company/entity ID to its display name via GET /entities/{id} */
+  private async resolveEntityName(id: string): Promise<string | null> {
+    try {
+      const response = await this.apiClient.makeRequest({ method: 'GET', endpoint: `/entities/${id}` });
+      const fields = (response as any)?.data?.fields ?? (response as any)?.fields ?? (response as any)?.data ?? response;
+      return (fields as any)?.name ?? (fields as any)?.domain ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Resolve a feature ID to its name and URL via GET /entities/{id} */
+  private async resolveFeature(id: string): Promise<ResolvedFeature | null> {
+    try {
+      const response = await this.apiClient.makeRequest({ method: 'GET', endpoint: `/entities/${id}` });
+      const data = (response as any)?.data ?? response;
+      const name = data?.fields?.name ?? null;
+      if (!name) return null;
+      const url = data?.links?.html ?? null;
+      return { name, url };
+    } catch {
+      return null;
+    }
+  }
+
   protected async executeInternal(params: ListNotesParams = {}): Promise<unknown> {
     this.logger.info('Listing notes');
 
@@ -125,31 +155,116 @@ export class ListNotesTool extends BaseTool<ListNotesParams> {
     const limit = params.limit || 100;
     const notes = allNotes.slice(0, limit);
 
-    const stripHtml = (s: string) => s
+    const stripHtml = (s: unknown): string => String(s)
       .replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<')
       .replace(/&gt;/g, '>').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+
+    // Content: string for textNote, array of parts for conversationNote
+    const extractContent = (fields: any): string => {
+      if (typeof fields?.content === 'string') {
+        return stripHtml(fields.content);
+      } else if (Array.isArray(fields?.content)) {
+        return fields.content
+          .map((part: any) => {
+            const who = part.authorName ?? part.authorType ?? 'Unknown';
+            const text = stripHtml(String(part.content ?? ''));
+            return `[${who}]: ${text}`;
+          })
+          .join(' | ');
+      }
+      return '';
+    };
+
+    // Collect unique company IDs that need resolving, then batch-resolve in parallel
+    const companyIds: string[] = [
+      ...new Set<string>(
+        notes.flatMap((note: any) =>
+          (note.relationships?.data ?? [])
+            .filter((r: any) => r.type === 'customer' && r.target?.type === 'company' && !r.target.name)
+            .map((r: any) => r.target.id as string)
+        )
+      ),
+    ];
+    const companyNames = new Map<string, string>();
+    await Promise.all(
+      companyIds.map(async (id) => {
+        const name = await this.resolveEntityName(id);
+        if (name) companyNames.set(id, name);
+      })
+    );
+
+    // Collect unique feature IDs from all notes, then batch-resolve in parallel
+    const featureIds: string[] = [
+      ...new Set<string>(
+        notes.flatMap((note: any) =>
+          (note.relationships?.data ?? [])
+            .filter((r: any) => r.type === 'link' && r.target?.type === 'feature')
+            .map((r: any) => r.target.id as string)
+        )
+      ),
+    ];
+    const resolvedFeatures = new Map<string, ResolvedFeature>();
+    await Promise.all(
+      featureIds.map(async (id) => {
+        const feature = await this.resolveFeature(id);
+        if (feature) resolvedFeatures.set(id, feature);
+      })
+    );
+
+    // Extract company from relationships, resolving IDs to names where possible
+    const extractCompany = (note: any): string | null => {
+      const rels: any[] = note.relationships?.data ?? [];
+      const customerRel = rels.find((r: any) => r.type === 'customer');
+      if (customerRel?.target?.type === 'company') {
+        const target = customerRel.target;
+        return companyNames.get(target.id) ?? target.name ?? target.domain ?? `ID: ${target.id}`;
+      }
+      return null;
+    };
+
+    // Links: Productboard UI URL + linked features (resolved to name + url)
+    const extractLinks = (note: any): { html: string | null; features: Array<{ id: string; name: string; url: string | null }> } => {
+      const html = note.links?.html ?? null;
+      const features = (note.relationships?.data ?? [])
+        .filter((r: any) => r.type === 'link' && r.target?.type === 'feature')
+        .map((r: any) => {
+          const id = r.target.id as string;
+          const resolved = resolvedFeatures.get(id);
+          return { id, name: resolved?.name ?? id, url: resolved?.url ?? null };
+        });
+      return { html, features };
+    };
 
     // Format response for MCP protocol
     const formattedNotes = notes.map((note: any) => ({
       id: note.id,
-      title: note.fields?.name || (note.fields?.content ? stripHtml(note.fields.content).substring(0, 60) : 'Untitled Note'),
-      content: note.fields?.content ? stripHtml(note.fields.content) : '',
+      title: note.fields?.name || (extractContent(note.fields).substring(0, 60) || 'Untitled Note'),
+      content: extractContent(note.fields),
       owner: note.fields?.owner?.email || 'Unknown',
+      company: extractCompany(note),
+      links: extractLinks(note),
       createdAt: note.createdAt,
-      tags: note.fields?.tags || [],
+      tags: (note.fields?.tags || []).map((t: any) => t?.name ?? t?.label ?? String(t)),
     }));
 
     // Create a text summary of the notes
     const summary = formattedNotes.length > 0
       ? `Found ${allNotes.length} notes total, showing ${formattedNotes.length}:\n\n` +
-        formattedNotes.map((n, i) =>
+        formattedNotes.map((n: any, i: number) =>
           `${i + 1}. ${n.title}\n` +
+          `   ID: ${n.id}\n` +
+          (n.createdAt ? `   Created: ${n.createdAt}\n` : '') +
           `   Owner: ${n.owner}\n` +
+          (n.company ? `   Company: ${n.company}\n` : '') +
           `   Content: ${n.content}\n` +
-          `   Tags: ${n.tags.length > 0 ? n.tags.join(', ') : 'None'}\n`
+          `   Tags: ${n.tags.length > 0 ? n.tags.join(', ') : 'None'}\n` +
+          (n.links.html ? `   URL: ${n.links.html}\n` : '') +
+          (n.links.features.length > 0
+            ? `   Linked features: ${n.links.features.map((f: any) => f.url ? `${f.name} (${f.url})` : f.name).join(', ')}\n`
+            : '')
         ).join('\n')
       : 'No notes found.';
-    
+
     // Return in MCP expected format
     return {
       content: [

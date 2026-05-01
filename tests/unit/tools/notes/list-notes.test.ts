@@ -2,11 +2,9 @@ import { ListNotesTool } from '@tools/notes/list-notes';
 import { ProductboardAPIClient } from '@api/index';
 import { Logger } from '@utils/logger';
 
-
-
 describe('ListNotesTool', () => {
   let tool: ListNotesTool;
-  let mockApiClient: jest.Mocked<ProductboardAPIClient>;
+  let mockApiClient: jest.Mocked<ProductboardAPIClient> & { getAllPages: jest.Mock };
   let mockLogger: jest.Mocked<Logger>;
 
   beforeEach(() => {
@@ -106,13 +104,27 @@ describe('ListNotesTool', () => {
     const mockNotes = [
       {
         id: 'note-1',
-        fields: { name: 'First feedback', content: '<p>First feedback</p>', owner: { email: 'owner1@example.com' }, tags: [] },
+        fields: {
+          name: 'First note',
+          content: 'First feedback',
+          owner: { email: 'owner1@example.com' },
+          tags: [],
+        },
         createdAt: '2025-01-15T00:00:00Z',
+        relationships: { data: [] },
+        links: { html: 'https://example.productboard.com/notes/note-1' },
       },
       {
         id: 'note-2',
-        fields: { name: 'Second feedback', content: '<p>Second feedback</p>', owner: { email: 'owner2@example.com' }, tags: [] },
+        fields: {
+          name: 'Second note',
+          content: 'Second feedback',
+          owner: { email: 'owner2@example.com' },
+          tags: ['bug'],
+        },
         createdAt: '2025-01-14T00:00:00Z',
+        relationships: { data: [] },
+        links: {},
       },
     ];
 
@@ -124,9 +136,9 @@ describe('ListNotesTool', () => {
       expect(mockApiClient.getAllPages).toHaveBeenCalledWith('/notes', {});
 
       expect(result.content[0].type).toBe('text');
-      expect(result.content[0].text).toContain('Found 2 notes');
-      expect(result.content[0].text).toContain('First feedback');
-      expect(result.content[0].text).toContain('Second feedback');
+      expect(result.content[0].text).toContain('Found 2 notes total, showing 2');
+      expect(result.content[0].text).toContain('First note');
+      expect(result.content[0].text).toContain('Second note');
 
       expect(mockLogger.info).toHaveBeenCalledWith('Listing notes');
     });
@@ -226,12 +238,12 @@ describe('ListNotesTool', () => {
       });
     });
 
-    it('should respect custom limit', async () => {
+    it('should respect custom limit (client-side slice)', async () => {
       mockApiClient.getAllPages.mockResolvedValue(mockNotes);
 
       const result = await tool.execute({ limit: 1 });
 
-      // limit is applied client-side, not sent to API
+      // limit is not sent to API — getAllPages fetches all, then we slice
       expect(mockApiClient.getAllPages).toHaveBeenCalledWith('/notes', {});
 
       // Only 1 note returned due to client-side limit
@@ -266,6 +278,316 @@ describe('ListNotesTool', () => {
       const result = await tool.execute({});
       const parsed = JSON.parse(result.content[0].text);
       expect(parsed.success).toBe(false);
+    });
+
+    describe('content extraction', () => {
+      it('should strip HTML from plain text content', async () => {
+        const noteWithHtml = [{
+          id: 'note-html',
+          fields: { content: '<p>Hello <strong>world</strong></p>', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: { data: [] },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithHtml);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('Hello world');
+        expect(result.content[0].text).not.toContain('<p>');
+        expect(result.content[0].text).not.toContain('<strong>');
+      });
+
+      it('should format conversationNote content with author prefixes', async () => {
+        const conversationNote = [{
+          id: 'note-conv',
+          fields: {
+            content: [
+              { authorName: 'Alice', content: 'Hello there' },
+              { authorName: 'Bob', content: 'Hi back' },
+            ],
+            tags: [],
+          },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: { data: [] },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(conversationNote);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('[Alice]: Hello there');
+        expect(result.content[0].text).toContain('[Bob]: Hi back');
+      });
+
+      it('should fall back to authorType when authorName is absent', async () => {
+        const conversationNote = [{
+          id: 'note-conv2',
+          fields: {
+            content: [
+              { authorType: 'customer', content: 'I need help' },
+            ],
+            tags: [],
+          },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: { data: [] },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(conversationNote);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('[customer]: I need help');
+      });
+    });
+
+    describe('company extraction', () => {
+      it('should show company name from relationship target when available', async () => {
+        const noteWithCompany = [{
+          id: 'note-co',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'customer', target: { type: 'company', id: 'co-1', name: 'Acme Corp' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithCompany);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('Company: Acme Corp');
+      });
+
+      it('should resolve company ID to name via API when name is absent', async () => {
+        const noteWithCompanyId = [{
+          id: 'note-co2',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'customer', target: { type: 'company', id: 'co-unknown-id' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithCompanyId);
+        mockApiClient.makeRequest.mockResolvedValue({ data: { fields: { name: 'Resolved Corp' } } });
+
+        const result = await tool.execute({});
+
+        expect(mockApiClient.makeRequest).toHaveBeenCalledWith({
+          method: 'GET',
+          endpoint: '/entities/co-unknown-id',
+        });
+        expect(result.content[0].text).toContain('Company: Resolved Corp');
+      });
+
+      it('should show domain as fallback when entity API has no name', async () => {
+        const noteWithCompanyId = [{
+          id: 'note-co3',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'customer', target: { type: 'company', id: 'co-domain-id' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithCompanyId);
+        mockApiClient.makeRequest.mockResolvedValue({ data: { fields: { domain: 'acme.com' } } });
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('Company: acme.com');
+      });
+
+      it('should fall back to ID string when entity API call fails', async () => {
+        const noteWithCompanyId = [{
+          id: 'note-co4',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'customer', target: { type: 'company', id: 'co-fail-id' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithCompanyId);
+        mockApiClient.makeRequest.mockRejectedValue(new Error('Not found'));
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('Company: ID: co-fail-id');
+      });
+
+      it('should batch-resolve company IDs without duplicate API calls', async () => {
+        const notesWithSameCompany = [
+          {
+            id: 'note-a',
+            fields: { content: 'Feedback A', tags: [] },
+            createdAt: '2025-01-01T00:00:00Z',
+            relationships: {
+              data: [{ type: 'customer', target: { type: 'company', id: 'shared-co-id' } }],
+            },
+            links: {},
+          },
+          {
+            id: 'note-b',
+            fields: { content: 'Feedback B', tags: [] },
+            createdAt: '2025-01-01T00:00:00Z',
+            relationships: {
+              data: [{ type: 'customer', target: { type: 'company', id: 'shared-co-id' } }],
+            },
+            links: {},
+          },
+        ];
+        mockApiClient.getAllPages.mockResolvedValue(notesWithSameCompany);
+        mockApiClient.makeRequest.mockResolvedValue({ data: { fields: { name: 'Shared Corp' } } });
+
+        await tool.execute({});
+
+        // Should only call the entity API once despite two notes with the same company ID
+        expect(mockApiClient.makeRequest).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe('links extraction', () => {
+      it('should include Productboard URL when present', async () => {
+        const noteWithUrl = [{
+          id: 'note-url',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: { data: [] },
+          links: { html: 'https://myorg.productboard.com/all-notes/notes/12345' },
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithUrl);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('URL: https://myorg.productboard.com/all-notes/notes/12345');
+      });
+
+      it('should omit URL line when links.html is absent', async () => {
+        const noteWithoutUrl = [{
+          id: 'note-no-url',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: { data: [] },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithoutUrl);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).not.toContain('URL:');
+      });
+
+      it('should include linked feature IDs from relationships when resolution fails', async () => {
+        const noteWithFeature = [{
+          id: 'note-feat',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [
+              { type: 'link', target: { type: 'feature', id: 'feat-abc' } },
+              { type: 'link', target: { type: 'feature', id: 'feat-def' } },
+            ],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithFeature);
+        mockApiClient.makeRequest.mockRejectedValue(new Error('Not found'));
+
+        const result = await tool.execute({});
+
+        // Falls back to raw IDs when resolution fails
+        expect(result.content[0].text).toContain('Linked features: feat-abc, feat-def');
+      });
+
+      it('should resolve linked feature IDs to names via API', async () => {
+        const noteWithFeature = [{
+          id: 'note-feat-resolved',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'link', target: { type: 'feature', id: 'feat-xyz' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithFeature);
+        mockApiClient.makeRequest.mockResolvedValue({
+          data: {
+            fields: { name: 'My Feature Name' },
+            links: { html: 'https://example.productboard.com/detail/abc123' },
+          },
+        });
+
+        const result = await tool.execute({});
+
+        expect(mockApiClient.makeRequest).toHaveBeenCalledWith({
+          method: 'GET',
+          endpoint: '/entities/feat-xyz',
+        });
+        expect(result.content[0].text).toContain('Linked features: My Feature Name (https://example.productboard.com/detail/abc123)');
+      });
+
+      it('should show feature name without URL when links.html is absent', async () => {
+        const noteWithFeature = [{
+          id: 'note-feat-no-url',
+          fields: { content: 'Feedback', tags: [] },
+          createdAt: '2025-01-01T00:00:00Z',
+          relationships: {
+            data: [{ type: 'link', target: { type: 'feature', id: 'feat-no-url' } }],
+          },
+          links: {},
+        }];
+        mockApiClient.getAllPages.mockResolvedValue(noteWithFeature);
+        mockApiClient.makeRequest.mockResolvedValue({
+          data: { fields: { name: 'Feature Without URL' }, links: {} },
+        });
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).toContain('Linked features: Feature Without URL');
+        expect(result.content[0].text).not.toContain('(http');
+      });
+
+      it('should batch-resolve feature IDs without duplicate API calls', async () => {
+        const notesWithSameFeature = [
+          {
+            id: 'note-fa',
+            fields: { content: 'Feedback A', tags: [] },
+            createdAt: '2025-01-01T00:00:00Z',
+            relationships: {
+              data: [{ type: 'link', target: { type: 'feature', id: 'shared-feat-id' } }],
+            },
+            links: {},
+          },
+          {
+            id: 'note-fb',
+            fields: { content: 'Feedback B', tags: [] },
+            createdAt: '2025-01-01T00:00:00Z',
+            relationships: {
+              data: [{ type: 'link', target: { type: 'feature', id: 'shared-feat-id' } }],
+            },
+            links: {},
+          },
+        ];
+        mockApiClient.getAllPages.mockResolvedValue(notesWithSameFeature);
+        mockApiClient.makeRequest.mockResolvedValue({
+          data: { fields: { name: 'Shared Feature' }, links: { html: 'https://example.com' } },
+        });
+
+        await tool.execute({});
+
+        // Should only call the entity API once despite two notes with the same feature ID
+        expect(mockApiClient.makeRequest).toHaveBeenCalledTimes(1);
+      });
+
+      it('should omit linked features line when no feature links exist', async () => {
+        mockApiClient.getAllPages.mockResolvedValue([mockNotes[0]]);
+
+        const result = await tool.execute({});
+
+        expect(result.content[0].text).not.toContain('Linked features:');
+      });
     });
   });
 });
