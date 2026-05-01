@@ -163,10 +163,12 @@ describe('GetNoteTool', () => {
       expect(result.content[0].text).not.toContain('URL:');
     });
 
-    it('should propagate API errors', async () => {
+    it('should return an error response on API failure', async () => {
       mockApiClient.get.mockRejectedValue(new Error('Network failure'));
 
-      await expect(tool.execute({ id: baseNote.id })).rejects.toThrow('Tool pb_note_get execution failed');
+      const result = await tool.execute({ id: baseNote.id });
+      const parsed = JSON.parse(result.content[0].text);
+      expect(parsed.success).toBe(false);
     });
   });
 
